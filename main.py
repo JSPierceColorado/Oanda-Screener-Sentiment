@@ -18,6 +18,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("forex-sentiment-bot")
 
+# Flag so we only dump one sample payload per run
+PRINTED_SAMPLE = False
+
 # --------------------------------------------------------------------------------------
 # Google Sheets helpers
 # --------------------------------------------------------------------------------------
@@ -81,7 +84,7 @@ def create_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
         "Accept": "application/json",
-        "User-Agent": "Aletheia-ForexSentimentBot/1.0"
+        "User-Agent": "Aletheia-ForexSentimentBot/1.2"
     })
     return s
 
@@ -97,10 +100,15 @@ def fetch_sentiment_for_pair(
     """
     Fetch sentiment for a currency pair from ForexNewsAPI's Sentiment Analysis endpoint.
 
-    Expected pattern (you'll confirm in your docs):
+    Expected pattern (per docs):
         GET {sentiment_url}?currencypair=EUR-USD&date=last7days&token=YOUR_KEY
 
     We convert OANDA style 'EUR_USD' -> 'EUR-USD'.
+
+    We defensively handle shapes like:
+      - {"sentimentscore": ...}
+      - {"data": [{...}]}
+      - {"EUR-USD": {"sentimentscore": ...}, ...}
     """
     pair_fx = pair_code_oanda.replace("_", "-")
 
@@ -136,27 +144,52 @@ def fetch_sentiment_for_pair(
         logger.warning("Invalid JSON (sentiment) for pair %s (%s)", pair_code_oanda, pair_fx)
         return None
 
-    # ForexNewsAPI sentiment endpoints may return a dict or list.
-    # We'll try a few reasonable shapes:
     item: Optional[Dict[str, Any]] = None
 
+    # ----- Case 1: dict keyed by pair, e.g. {"EUR-USD": {...}, "GBP-USD": {...}} -----
     if isinstance(data, dict):
-        # e.g. {'currencypair': 'EUR-USD', 'sentimentscore': 0.85, ...}
-        item = data
-        # or sometimes under a key like 'data' / 'results'
-        for key in ("data", "results", "sentiment"):
-            if isinstance(data.get(key), dict):
-                item = data[key]
-                break
-            if isinstance(data.get(key), list) and data[key]:
-                item = data[key][0]
-                break
-    elif isinstance(data, list) and data:
-        item = data[0]
+        lower_keys = {k.lower(): k for k in data.keys()}
+
+        # Direct match on pair (case-insensitive)
+        key_exact = lower_keys.get(pair_fx.lower())
+        if key_exact and isinstance(data.get(key_exact), dict):
+            item = data[key_exact]
+        else:
+            # Common container keys
+            for key in ("data", "results", "sentiment"):
+                v = data.get(key)
+                if isinstance(v, dict):
+                    inner_lk = {kk.lower(): kk for kk in v.keys()}
+                    k2 = inner_lk.get(pair_fx.lower())
+                    if k2 and isinstance(v.get(k2), dict):
+                        item = v[k2]
+                        break
+                if isinstance(v, list) and v:
+                    if isinstance(v[0], dict):
+                        item = v[0]
+                        break
+
+            # Fallback: maybe it's already a single-pair dict like {"sentimentscore": ...}
+            if item is None:
+                if any("sentiment" in k.lower() or "score" in k.lower() for k in data.keys()):
+                    item = data
+
+    # ----- Case 2: top-level list of dicts -----
+    if item is None and isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            item = first
 
     if not isinstance(item, dict):
         logger.warning("Unexpected sentiment payload for pair %s: %r", pair_code_oanda, data)
         return None
+
+    global PRINTED_SAMPLE
+    if not PRINTED_SAMPLE:
+        # Log a single sample item so you can see raw structure in Railway logs
+        trimmed = {k: item[k] for k in list(item.keys())[:10]}  # first 10 keys
+        logger.info("Sample sentiment payload for %s: %r", pair_code_oanda, trimmed)
+        PRINTED_SAMPLE = True
 
     return item
 
@@ -165,14 +198,14 @@ def normalize_sentiment_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize ForexNewsAPI sentiment response into a uniform dict we can write to the sheet.
 
-    Their docs mention Sentiment Score ranges from -1.5 (Negative) to +1.5 (Positive). :contentReference[oaicite:1]{index=1}
-    We'll try to detect:
-      - sentiment score (numeric)
+    Sentiment Score ranges from -1.5 (Negative) to +1.5 (Positive) per docs.
+    We try to detect:
+      - sentiment score (numeric OR text)
       - positive / negative / neutral counts if available
       - date of the sentiment value
     """
 
-    # Try several likely keys for the numeric score
+    # ---------- Sentiment score (numeric) ----------
     score_raw = (
         item.get("sentimentscore")
         or item.get("sentiment_score")
@@ -180,12 +213,43 @@ def normalize_sentiment_item(item: Dict[str, Any]) -> Dict[str, Any]:
         or item.get("sentimentScore")
     )
 
+    # Generic numeric key scan if not found
+    if score_raw is None:
+        for k, v in item.items():
+            kl = k.lower()
+            if ("sentiment" in kl or "score" in kl) and v not in (None, ""):
+                try:
+                    score_raw = float(v)
+                    break
+                except (TypeError, ValueError):
+                    continue
+
     try:
-        score = float(score_raw)
+        score = float(score_raw) if score_raw is not None else None
     except (TypeError, ValueError):
         score = None
 
-    # Optional counts / totals (these may or may not exist)
+    # ---------- Sentiment text (positive/negative/neutral) ----------
+    sentiment_text = (
+        item.get("sentiment")
+        or item.get("newsentiment")
+        or item.get("sentiment_label")
+        or item.get("label")
+    )
+
+    if isinstance(sentiment_text, str):
+        st = sentiment_text.strip().lower()
+        if "positive" in st or st == "pos":
+            if score is None:
+                score = 1.0
+        elif "negative" in st or st == "neg":
+            if score is None:
+                score = -1.0
+        elif "neutral" in st or st == "neu":
+            if score is None:
+                score = 0.0
+
+    # ---------- Counts (positive/negative/neutral/total) ----------
     pos = (
         item.get("positive")
         or item.get("pos")
@@ -207,25 +271,42 @@ def normalize_sentiment_item(item: Dict[str, Any]) -> Dict[str, Any]:
     total = (
         item.get("total")
         or item.get("total_news")
+        or item.get("total_articles")
         or item.get("num_articles")
         or item.get("articles")
     )
 
-    def _to_int(x):
+    def pick_int_like(key_substrings: List[str]) -> Optional[int]:
+        for k, v in item.items():
+            kl = k.lower()
+            if any(s in kl for s in key_substrings):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def to_int_safe(x):
         try:
             return int(x)
         except (TypeError, ValueError):
             return None
 
-    pos_i = _to_int(pos)
-    neg_i = _to_int(neg)
-    neu_i = _to_int(neu)
-    total_i = _to_int(total)
+    pos_i = to_int_safe(pos) or pick_int_like(["positive"])
+    neg_i = to_int_safe(neg) or pick_int_like(["negative"])
+    neu_i = to_int_safe(neu) or pick_int_like(["neutral"])
+    total_i = to_int_safe(total) or pick_int_like(["total", "articles", "news"])
 
     # If total isn't provided, approximate from pos/neg/neu
     if total_i is None:
         parts = [v for v in (pos_i, neg_i, neu_i) if v is not None]
         total_i = sum(parts) if parts else None
+
+    # If still no score but we have counts, derive a score in [-1.5, 1.5]
+    if score is None and total_i and total_i > 0:
+        pos_val = pos_i or 0
+        neg_val = neg_i or 0
+        score = 1.5 * (pos_val - neg_val) / float(total_i)
 
     # Percentages if we have total
     if total_i and total_i > 0:
@@ -235,17 +316,24 @@ def normalize_sentiment_item(item: Dict[str, Any]) -> Dict[str, Any]:
         pos_pct = ""
         neg_pct = ""
 
-    # Date/time field for when this sentiment is measured
+    # ---------- Date / as-of field ----------
     sent_date = (
         item.get("date")
         or item.get("sentiment_date")
         or item.get("asof")
-        or ""
+        or item.get("as_of")
     )
 
-    # Label + emoji from score
+    if not sent_date:
+        for k, v in item.items():
+            kl = k.lower()
+            if "date" in kl or "time" in kl:
+                sent_date = v
+                break
+
+    # ---------- Label + emoji ----------
     if score is None:
-        label = ""
+        label = sentiment_text or ""
         emoji = ""
     else:
         if score >= 1.0:
@@ -264,12 +352,12 @@ def normalize_sentiment_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "score": score,
-        "label": label,
+        "label": label or "",
         "emoji": emoji,
         "pos_pct": pos_pct,
         "neg_pct": neg_pct,
         "total": total_i if total_i is not None else "",
-        "date": sent_date,
+        "date": sent_date or "",
     }
 
 
@@ -310,10 +398,7 @@ def write_sentiment_to_sheet(
     ]
 
     # Write headers into T1:Z1 (7 columns)
-    ws.update(
-        range_name="T1:Z1",
-        values=[headers],
-    )
+    ws.update("T1", [headers])
 
     max_row = max(row_results.keys())
     values: List[List[Any]] = []
@@ -321,7 +406,6 @@ def write_sentiment_to_sheet(
     for row_idx in range(2, max_row + 1):
         sentiment = row_results.get(row_idx)
         if not sentiment:
-            # Keep existing cells untouched by sending blanks
             values.append([""] * len(headers))
             continue
 
@@ -348,10 +432,7 @@ def write_sentiment_to_sheet(
     end_row = max_row
     range_name = f"T2:Z{end_row}"
     logger.info("Updating sentiment columns %s", range_name)
-    ws.update(
-        range_name=range_name,
-        values=values,
-    )
+    ws.update(range_name, values)
 
 
 # --------------------------------------------------------------------------------------
@@ -367,11 +448,8 @@ def run_sentiment_once():
     if not api_key:
         raise RuntimeError("FOREX_NEWS_API_KEY env var is required")
 
-    # IMPORTANT:
-    # This should be the Sentiment Analysis endpoint URL for INDIVIDUAL pairs,
-    # as shown under "GET Sentiment Analysis" -> "For Individual currency pairs" in the docs.
-    # Example guess (override if docs show different):
-    #   https://forexnewsapi.com/api/v1/sentiment
+    # Individual pair sentiment endpoint URL,
+    # e.g. https://forexnewsapi.com/api/v1/sentiment-individual  (whatever your docs show)
     sentiment_url = os.environ.get(
         "FOREX_NEWS_SENTIMENT_URL",
         "https://forexnewsapi.com/api/v1/sentiment",
