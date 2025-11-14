@@ -1,356 +1,514 @@
 import os
-import time
 import json
+import time
 import logging
-from typing import Tuple, List, Optional
+import re
+from datetime import datetime, timedelta, timezone
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# -----------------------------------
-# Logging setup
-# -----------------------------------
+# ---------- Logging setup ----------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# -----------------------------------
-# Config / Environment
-# -----------------------------------
+# ---------- Env & constants ----------
+
 FOREX_NEWS_API_KEY = os.getenv("FOREX_NEWS_API_KEY")
 
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
-GOOGLE_SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "Oanda-Screener")
+# Sheet / tab names – support multiple env var names, with sensible defaults
+SHEET_NAME = (
+    os.getenv("FOREX_SHEET_NAME")
+    or os.getenv("GOOGLE_SHEET_NAME")
+    or "Active-Investing"
+)
+WORKSHEET_NAME = (
+    os.getenv("FOREX_SHEET_TAB")
+    or os.getenv("GOOGLE_WORKSHEET_NAME")
+    or "Oanda-Screener"
+)
 
-UPDATE_INTERVAL_SECONDS = int(os.getenv("FOREX_NEWS_INTERVAL_SECONDS", "21600"))
+# How often to run
+UPDATE_INTERVAL_SECONDS = int(os.getenv("FOREX_SENTIMENT_INTERVAL_SECONDS", "21600"))
 
-# We will ONLY write to T and U:
-# T = news_top_keywords_7d
-# U = news_emoji_7d
-NEWS_HEADER_RANGE = "T1:U1"
-NEWS_DATA_START_ROW = 2  # data begins on row 2
-NEWS_DATA_COLUMNS_RANGE_TEMPLATE = "T{start_row}:U{end_row}"
+# How many days of news to consider (we enforce this *ourselves*, not via API params)
+WINDOW_DAYS = int(os.getenv("FOREX_SENTIMENT_WINDOW_DAYS", "7"))
 
-NEWS_TOP_KEYWORDS_COL_HEADER = "news_top_keywords_7d"
-NEWS_EMOJI_COL_HEADER = "news_emoji_7d"
+# Max news items per pair per API call
+MAX_ITEMS_PER_PAIR = int(os.getenv("FOREX_NEWS_MAX_ITEMS_PER_PAIR", "50"))
 
-FOREX_NEWS_STAT_URL = "https://forexnewsapi.com/api/v1/stat"
-
-# -----------------------------------
-# Universe of pairs (68 total)
-# (Matches the order seen in your logs)
-# -----------------------------------
-FOREX_PAIRS: List[str] = [
-    "NZD_SGD",
-    "USD_SGD",
-    "EUR_SEK",
-    "GBP_NZD",
-    "EUR_PLN",
-    "AUD_CAD",
-    "GBP_CAD",
-    "USD_MXN",
-    "GBP_USD",
-    "AUD_USD",
-    "GBP_PLN",
-    "USD_TRY",
-    "GBP_JPY",
-    "SGD_CHF",
-    "SGD_JPY",
-    "GBP_ZAR",
-    "USD_JPY",
-    "EUR_TRY",
-    "EUR_JPY",
-    "AUD_SGD",
-    "EUR_NZD",
-    "GBP_HKD",
-    "CHF_JPY",
-    "EUR_HKD",
-    "USD_THB",
-    "GBP_CHF",
-    "AUD_CHF",
-    "NZD_CHF",
-    "AUD_HKD",
-    "USD_CHF",
-    "CAD_HKD",
-    "USD_HKD",
-    "NZD_JPY",
-    "ZAR_JPY",
-    "AUD_JPY",
-    "EUR_SGD",
-    "TRY_JPY",
-    "CHF_HKD",
-    "GBP_SGD",
-    "USD_SEK",
-    "NZD_HKD",
-    "USD_CNH",
-    "USD_CZK",
-    "EUR_GBP",
-    "EUR_NOK",
-    "USD_CAD",
-    "EUR_AUD",
-    "CAD_CHF",
-    "AUD_NZD",
-    "HKD_JPY",
-    "USD_NOK",
-    "GBP_AUD",
-    "USD_PLN",
-    "EUR_ZAR",
-    "NZD_USD",
-    "USD_ZAR",
-    "CAD_JPY",
-    "CAD_SGD",
-    "USD_HUF",
-    "EUR_CAD",
-    "CHF_ZAR",
-    "USD_DKK",
-    "EUR_HUF",
-    "EUR_CHF",
-    "EUR_DKK",
-    "EUR_USD",
-    "EUR_CZK",
-    "NZD_CAD",
-]
+# ---------- Helpers ----------
 
 
-# -----------------------------------
-# Google Sheets helpers
-# -----------------------------------
-def get_gspread_client() -> gspread.Client:
-    if not GOOGLE_CREDS_JSON:
-        raise RuntimeError("GOOGLE_CREDS_JSON is not set")
+def column_index_to_letter(idx: int) -> str:
+    """Convert 1-based column index to Excel-style letter (1 -> A, 27 -> AA)."""
+    letters = ""
+    while idx > 0:
+        idx, remainder = divmod(idx - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
 
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    client = gspread.service_account_from_dict(creds_dict)
+
+def normalize_header_name(name: str) -> str:
+    """Lowercase, strip, and collapse non-alphanumerics to underscores."""
+    return re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+
+
+def parse_article_date(date_str: str) -> Optional[datetime]:
+    """Parse ISO-like date from API. Returns timezone-aware UTC datetime or None."""
+    if not date_str:
+        return None
+
+    # Common formats, e.g. 2025-11-14T03:45:00-04:00 or with Z
+    try:
+        # Normalize Z to +00:00 for fromisoformat
+        if date_str.endswith("Z"):
+            date_str = date_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            # Assume UTC if no tz given
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+# ---------- ForexNews API client ----------
+
+
+class ForexNewsAPIClient:
+    BASE_URL = "https://forexnewsapi.com/api/v1"
+
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise ValueError("FOREX_NEWS_API_KEY is not set")
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "ForexSentimentBot/1.0"})
+
+    def get_pair_news(self, oanda_pair: str) -> Dict[str, Any]:
+        """
+        Call the *news* endpoint (NOT /stat) for a single currency pair.
+
+        We DO NOT send &date=... because your plan doesn’t allow it.
+        Instead, we filter by date locally.
+        """
+        currencypair = oanda_pair.replace("_", "-").upper().strip()
+
+        params = {
+            "currencypair": currencypair,
+            "items": MAX_ITEMS_PER_PAIR,
+            "token": self.api_key,
+            # do NOT include 'date' – plan does not allow it
+        }
+
+        resp = self.session.get(self.BASE_URL, params=params, timeout=20)
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            body = None
+            try:
+                body = resp.text
+            except Exception:
+                pass
+            msg = f"{resp.status_code}"
+            if body:
+                msg += f" | body: {body}"
+            logging.warning("HTTP error (news) for pair %s: %s", currencypair, msg)
+            raise
+
+        try:
+            data = resp.json()
+        except ValueError:
+            logging.warning(
+                "Non-JSON response from ForexNewsAPI for %s: %s",
+                currencypair,
+                resp.text[:300],
+            )
+            raise
+
+        # Some of these APIs use {"data": [...]} and some just return a list
+        if isinstance(data, dict) and "data" in data:
+            articles = data.get("data") or []
+        elif isinstance(data, list):
+            articles = data
+        else:
+            logging.warning(
+                "Unexpected JSON structure for %s: %s",
+                currencypair,
+                str(data)[:300],
+            )
+            articles = []
+
+        return {
+            "currencypair": currencypair,
+            "raw": data,
+            "articles": articles,
+        }
+
+    def summarize_pair_sentiment(
+        self, oanda_pair: str, window_days: int = WINDOW_DAYS
+    ) -> Dict[str, Any]:
+        """
+        High-level helper: fetch news for a pair and compute sentiment summary.
+
+        Returns dict with keys like:
+        - status, error
+        - article_count, positive_count, negative_count, neutral_count
+        - avg_sentiment_score
+        - sentiment_label (bullish/bearish/neutral)
+        - emoji
+        - top_keywords
+        - last_updated
+        """
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(days=window_days)
+
+        try:
+            payload = self.get_pair_news(oanda_pair)
+        except Exception as e:
+            # Any HTTP/JSON problems become a clean error result
+            return {
+                "status": "error",
+                "error": str(e),
+                "article_count": 0,
+                "positive_count": 0,
+                "negative_count": 0,
+                "neutral_count": 0,
+                "avg_sentiment_score": None,
+                "sentiment_label": "error",
+                "emoji": "❌",
+                "top_keywords": "error",
+                "last_updated": now_utc.isoformat(),
+            }
+
+        articles = payload.get("articles", [])
+        # Filter articles to last N days based on their 'date' field
+        recent_articles: List[Dict[str, Any]] = []
+        for art in articles:
+            date_str = art.get("date") or art.get("published_at")
+            dt = parse_article_date(date_str) if date_str else None
+            if dt is None:
+                # If we can't parse the date, include it (being generous)
+                recent_articles.append(art)
+            elif dt >= cutoff:
+                recent_articles.append(art)
+
+        if not recent_articles:
+            return {
+                "status": "no_data",
+                "error": None,
+                "article_count": 0,
+                "positive_count": 0,
+                "negative_count": 0,
+                "neutral_count": 0,
+                "avg_sentiment_score": None,
+                "sentiment_label": "none",
+                "emoji": "➖",
+                "top_keywords": "",
+                "last_updated": now_utc.isoformat(),
+            }
+
+        pos = neg = neu = 0
+        score_sum = 0.0
+        score_count = 0
+
+        keyword_counter: Counter = Counter()
+
+        for art in recent_articles:
+            sentiment = (art.get("sentiment") or "").lower()
+            score = art.get("sentiment_score")
+
+            if sentiment == "positive":
+                pos += 1
+            elif sentiment == "negative":
+                neg += 1
+            else:
+                neu += 1
+
+            if isinstance(score, (int, float)):
+                score_sum += float(score)
+                score_count += 1
+
+            # Collect simple keywords from title
+            title = art.get("title") or ""
+            words = re.findall(r"[A-Za-z]{4,}", title)
+            for w in words:
+                wl = w.lower()
+                # basic stopwords
+                if wl in {"with", "from", "that", "this", "will", "have", "been"}:
+                    continue
+                keyword_counter[wl] += 1
+
+        avg_score = score_sum / score_count if score_count > 0 else None
+
+        # Decide overall sentiment label
+        if pos > neg and pos >= neu:
+            label = "bullish"
+            emoji = "🟢"
+        elif neg > pos and neg >= neu:
+            label = "bearish"
+            emoji = "🔴"
+        else:
+            label = "neutral"
+            emoji = "⚪"
+
+        top_keywords = ", ".join(
+            [kw for kw, _ in keyword_counter.most_common(5)]
+        )
+
+        return {
+            "status": "ok",
+            "error": None,
+            "article_count": len(recent_articles),
+            "positive_count": pos,
+            "negative_count": neg,
+            "neutral_count": neu,
+            "avg_sentiment_score": avg_score,
+            "sentiment_label": label,
+            "emoji": emoji,
+            "top_keywords": top_keywords,
+            "last_updated": now_utc.isoformat(),
+        }
+
+
+# ---------- Google Sheets helpers ----------
+
+
+def get_gspread_client():
+    creds_json = os.getenv("GOOGLE_CREDS_JSON")
+    if not creds_json:
+        raise ValueError("GOOGLE_CREDS_JSON env var is not set")
+
+    try:
+        creds_dict = json.loads(creds_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"GOOGLE_CREDS_JSON is not valid JSON: {e}")
+
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
     return client
 
 
-def get_worksheet() -> gspread.Worksheet:
+def get_worksheet():
     client = get_gspread_client()
-    sh = client.open(GOOGLE_SHEET_NAME)
-    ws = sh.worksheet(GOOGLE_SHEET_TAB)
+    sheet = client.open(SHEET_NAME)
+    ws = sheet.worksheet(WORKSHEET_NAME)
     return ws
 
 
-# -----------------------------------
-# ForexNewsAPI /stat helpers
-# -----------------------------------
-def pair_to_api_symbol(pair: str) -> str:
+def find_pair_column_index(header_row: List[str]) -> int:
     """
-    Convert our underscore pair (e.g. 'EUR_USD') to API symbol (e.g. 'EUR-USD').
+    Try to find the column that contains the Oanda pair codes.
+    We look for headers containing 'pair', 'instrument', or 'symbol'.
+    If none, default to column 1.
     """
-    return pair.replace("_", "-")
+    for idx, name in enumerate(header_row, start=1):
+        norm = normalize_header_name(name)
+        if any(key in norm for key in ("pair", "instrument", "symbol")):
+            return idx
+    return 1  # fallback: first column
 
 
-def classify_emoji_from_stat(stat: dict) -> str:
+def get_pairs_from_sheet(ws, max_pairs: Optional[int] = None) -> List[str]:
+    header = ws.row_values(1)
+    pair_col_idx = find_pair_column_index(header)
+    col_vals = ws.col_values(pair_col_idx)[1:]  # skip header
+
+    pairs: List[str] = [v.strip() for v in col_vals if v.strip()]
+    if max_pairs is not None:
+        pairs = pairs[:max_pairs]
+    return pairs
+
+
+def find_sentiment_block(ws) -> Tuple[int, int, List[str]]:
     """
-    Map sentiment stats to an emoji.
+    Find the two specific sentiment columns we care about:
 
-    This is intentionally simple & robust — if the fields are missing, fall back
-    to neutral / no-info icons without throwing.
-    """
-    if not isinstance(stat, dict):
-        return "➖"
+      - news_top_keywords_7d
+      - news_emoji_7d
 
-    sentiment = stat.get("sentiment") or {}
-    try:
-        bullish = float(sentiment.get("bullish", 0) or 0)
-        bearish = float(sentiment.get("bearish", 0) or 0)
-    except (TypeError, ValueError):
-        bullish, bearish = 0.0, 0.0
-
-    total = bullish + bearish
-
-    # No news or not enough data
-    if total < 0.1:
-        return "➖"
-
-    # Strongly bullish
-    if bullish > 0.55 and bullish - bearish > 0.15:
-        return "🟢"
-
-    # Strongly bearish
-    if bearish > 0.55 and bearish - bullish > 0.15:
-        return "🔴"
-
-    # Otherwise "mixed / neutral"
-    return "⚪"
-
-
-def extract_top_keywords(stat: dict, limit: int = 5) -> str:
-    """
-    Extract top keywords from the stat block and join them into a string.
-
-    We try to be robust against whatever format comes back (list of strings,
-    list of dicts, etc).
-    """
-    if not isinstance(stat, dict):
-        return ""
-
-    raw_kw = stat.get("top_keywords", []) or stat.get("keywords", []) or []
-
-    keywords: List[str] = []
-
-    if isinstance(raw_kw, list):
-        for item in raw_kw:
-            if isinstance(item, str):
-                keywords.append(item)
-            elif isinstance(item, dict):
-                # Common pattern: {"keyword": "...", "count": ...}
-                val = item.get("keyword")
-                if isinstance(val, str):
-                    keywords.append(val)
-    elif isinstance(raw_kw, dict):
-        # If it's a dict, maybe {"keyword1": count, "keyword2": count}
-        for key in raw_kw.keys():
-            if isinstance(key, str):
-                keywords.append(key)
-
-    # Deduplicate and limit
-    cleaned = [k.strip() for k in keywords if k and k.strip()]
-    if not cleaned:
-        return ""
-
-    return ", ".join(cleaned[:limit])
-
-
-def fetch_pair_sentiment(pair: str) -> Tuple[str, str]:
-    """
-    Fetch sentiment for a single currency pair from ForexNewsAPI /stat endpoint.
+    They must both exist and be adjacent (e.g. columns T and U).
 
     Returns:
-        (top_keywords_str, emoji)
+        (start_col_index, end_col_index, block_headers)
+    where block_headers is in sheet left-to-right order and will be exactly
+    ["news_top_keywords_7d", "news_emoji_7d"] (or whatever the header text is).
     """
-    if not FOREX_NEWS_API_KEY:
-        logging.warning("FOREX_NEWS_API_KEY not set; returning empty sentiment")
-        return "", "➖"
+    header = ws.row_values(1)
 
-    api_symbol = pair_to_api_symbol(pair)
-    params = {
-        "currencypair": api_symbol,
-        # NOTE: your plan currently complains about 'Stat section' access and 'date'.
-        # We *do not* send 'date' or 'page' to keep requests as simple as possible.
-        "token": FOREX_NEWS_API_KEY,
-    }
+    target_norms = {"news_top_keywords_7d", "news_emoji_7d"}
+    found: List[Tuple[int, str]] = []  # (index, header_text)
 
-    try:
-        resp = requests.get(FOREX_NEWS_STAT_URL, params=params, timeout=10)
-    except Exception as e:
-        logging.warning(
-            "Request exception (sentiment) for pair %s: %s",
-            api_symbol,
-            repr(e),
+    for idx, name in enumerate(header, start=1):
+        norm = normalize_header_name(name)
+        if norm in target_norms:
+            found.append((idx, name))
+
+    if len(found) != 2:
+        raise RuntimeError(
+            f"Expected exactly 2 sentiment columns (news_top_keywords_7d & news_emoji_7d), "
+            f"but found {len(found)}. Check your header row."
         )
-        return "error", "➖"
 
-    if not resp.ok:
-        text = resp.text.strip()
-        logging.warning(
-            "HTTP error (sentiment) for pair %s: %s | body: %s",
-            api_symbol,
-            resp.status_code,
-            text[:300],
+    # Sort by column index (left-to-right)
+    found.sort(key=lambda t: t[0])
+    indices = [t[0] for t in found]
+    headers = [t[1] for t in found]
+
+    # Require them to be adjacent (so range is exactly these two columns)
+    if indices[1] != indices[0] + 1:
+        raise RuntimeError(
+            "news_top_keywords_7d and news_emoji_7d must be adjacent columns "
+            "(e.g. T and U). Please move them side-by-side."
         )
-        # Mark as error but keep sheet consistent
-        return "error", "➖"
 
-    try:
-        data = resp.json()
-    except Exception as e:
-        logging.warning(
-            "JSON parse error for pair %s: %s | body: %s",
-            api_symbol,
-            repr(e),
-            resp.text[:300],
-        )
-        return "error", "➖"
+    start_idx = indices[0]
+    end_idx = indices[1]
+    block_headers = headers  # already in left-to-right order
 
-    # Try to locate the 'stat' block in different possible shapes
-    stat = None
-    if isinstance(data, dict):
-        if "stat" in data:
-            stat = data.get("stat")
-        elif "result" in data and isinstance(data["result"], dict):
-            stat = data["result"].get("stat")
-
-    if stat is None:
-        logging.warning(
-        "No 'stat' section found in response for pair %s. Data keys: %s",
-            api_symbol,
-            list(data.keys()),
-        )
-        return "error", "➖"
-
-    top_keywords = extract_top_keywords(stat, limit=5)
-    emoji = classify_emoji_from_stat(stat)
-
-    # If we truly have no keywords and sentiment is basically "no data"
-    if not top_keywords and emoji == "➖":
-        return "", "➖"
-
-    return top_keywords, emoji
+    return start_idx, end_idx, block_headers
 
 
-# -----------------------------------
-# Sheet update logic (ONLY T & U)
-# -----------------------------------
-def update_sheet_news_sentiment(ws: gspread.Worksheet) -> None:
+def build_row_values_for_summary(
+    block_headers: List[str], summary: Dict[str, Any]
+) -> List[Any]:
     """
-    For each pair in FOREX_PAIRS, fetch sentiment and write it to columns:
+    Map our sentiment summary dict into a row of values aligned with
+    the 'news_*' header names in block_headers.
 
-        T = news_top_keywords_7d
-        U = news_emoji_7d
-
-    Only these two columns are touched. All other columns remain untouched.
+    In our current setup, block_headers will only contain:
+      - news_top_keywords_7d
+      - news_emoji_7d
     """
-    num_pairs = len(FOREX_PAIRS)
-    logging.info("Updating news sentiment (Sentiment endpoint) for %d pairs", num_pairs)
+    values: List[Any] = []
 
-    # Ensure headers (T1:U1) are correct. This is harmless if they already exist.
-    ws.update(
-        NEWS_HEADER_RANGE,
-        [[NEWS_TOP_KEYWORDS_COL_HEADER, NEWS_EMOJI_COL_HEADER]],
-    )
+    for name in block_headers:
+        norm = normalize_header_name(name)
 
-    rows: List[List[Optional[str]]] = []
+        if norm == "news_sentiment_7d":
+            values.append(summary.get("sentiment_label"))
+        elif norm == "news_score_7d":
+            values.append(summary.get("avg_sentiment_score"))
+        elif norm == "news_count_7d":
+            values.append(summary.get("article_count"))
+        elif norm == "news_positive_7d":
+            values.append(summary.get("positive_count"))
+        elif norm == "news_negative_7d":
+            values.append(summary.get("negative_count"))
+        elif norm == "news_neutral_7d":
+            values.append(summary.get("neutral_count"))
+        elif norm == "news_top_keywords_7d":
+            values.append(summary.get("top_keywords"))
+        elif norm == "news_emoji_7d":
+            values.append(summary.get("emoji"))
+        elif norm == "news_last_updated_7d":
+            values.append(summary.get("last_updated"))
+        else:
+            # Unknown news_* column – leave blank so we don't stomp on anything
+            values.append("")
+    return values
 
-    for idx, pair in enumerate(FOREX_PAIRS, start=1):
-        logging.info("(%d/%d) Fetching sentiment for %s", idx, num_pairs, pair)
-        top_keywords, emoji = fetch_pair_sentiment(pair)
-        rows.append([top_keywords, emoji])
 
-    # Now write all values at once into T:U, rows aligned with FOREX_PAIRS.
-    start_row = NEWS_DATA_START_ROW
-    end_row = start_row + num_pairs - 1
-    range_a1 = NEWS_DATA_COLUMNS_RANGE_TEMPLATE.format(start_row=start_row, end_row=end_row)
-
-    logging.info("Updating sentiment columns %s", range_a1)
-    ws.update(range_a1, rows)
+# ---------- Main update logic ----------
 
 
-# -----------------------------------
-# Main loop
-# -----------------------------------
-def main() -> None:
+def update_sentiment_once():
     logging.info(
-        "Starting Forex sentiment bot (Sentiment endpoint). "
-        "Sheet='%s' Tab='%s' Interval=%ds",
-        GOOGLE_SHEET_NAME,
-        GOOGLE_SHEET_TAB,
+        "Starting Forex sentiment bot (Sentiment endpoint). Sheet='%s' Tab='%s' Interval=%ss",
+        SHEET_NAME,
+        WORKSHEET_NAME,
         UPDATE_INTERVAL_SECONDS,
     )
 
+    ws = get_worksheet()
+    header = ws.row_values(1)
+
+    # Get pairs
+    pairs = get_pairs_from_sheet(ws)
+    pair_count = len(pairs)
+    logging.info("Updating news sentiment (Sentiment endpoint) for %d pairs", pair_count)
+
+    # Find the specific news_top_keywords_7d / news_emoji_7d block to update
+    start_col_idx, end_col_idx, block_headers = find_sentiment_block(ws)
+    start_row = 2
+    end_row = start_row + pair_count - 1
+
+    start_col_letter = column_index_to_letter(start_col_idx)
+    end_col_letter = column_index_to_letter(end_col_idx)
+    range_a1 = f"{start_col_letter}{start_row}:{end_col_letter}{end_row}"
+
+    logging.info("Will update sentiment columns %s", range_a1)
+
+    fx_client = ForexNewsAPIClient(FOREX_NEWS_API_KEY)
+
+    all_rows: List[List[Any]] = []
+
+    for i, pair in enumerate(pairs, start=1):
+        logging.info("(%d/%d) Fetching sentiment for %s", i, pair_count, pair)
+        summary = fx_client.summarize_pair_sentiment(pair, window_days=WINDOW_DAYS)
+
+        # If there was a hard API error (403, etc.), mark row as "error" but still
+        # keep going so at least we can see something in the sheet.
+        if summary.get("status") == "error":
+            # overwrite some fields to make it obvious in the sheet
+            summary["sentiment_label"] = "error"
+            summary["emoji"] = "❌"
+            if not summary.get("top_keywords"):
+                summary["top_keywords"] = "error"
+
+        row_values = build_row_values_for_summary(block_headers, summary)
+        all_rows.append(row_values)
+
+    logging.info("Updating sentiment columns %s", range_a1)
+    ws.update(range_a1, all_rows, value_input_option="USER_ENTERED")
+    logging.info("Done updating sheet.")
+
+
+def main_loop():
     while True:
         try:
-            ws = get_worksheet()
-            update_sheet_news_sentiment(ws)
+            update_sentiment_once()
         except Exception as e:
-            logging.exception("Unhandled error during sentiment update: %s", repr(e))
+            logging.exception("Unexpected error in update loop: %s", e)
+            # Best-effort: write a single 'error' marker in the first row of the block
+            try:
+                ws = get_worksheet()
+                start_col_idx, end_col_idx, block_headers = find_sentiment_block(ws)
+                start_col_letter = column_index_to_letter(start_col_idx)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                error_row = ["" for _ in block_headers]
+                # Put timestamp in keywords col, "error" in emoji col
+                for idx, name in enumerate(block_headers):
+                    norm = normalize_header_name(name)
+                    if norm == "news_top_keywords_7d":
+                        error_row[idx] = now_iso
+                    elif norm == "news_emoji_7d":
+                        error_row[idx] = "error"
+                ws.update(
+                    f"{start_col_letter}2:{column_index_to_letter(start_col_idx + len(block_headers) - 1)}2",
+                    [error_row],
+                    value_input_option="USER_ENTERED",
+                )
+            except Exception:
+                # Don't let error-reporting crash loop
+                logging.exception("Failed to write error marker to sheet")
 
         logging.info("Sleeping for %d seconds...", UPDATE_INTERVAL_SECONDS)
         time.sleep(UPDATE_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    main()
+    main_loop()
