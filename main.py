@@ -6,7 +6,6 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import requests
 import gspread
-import pandas as pd
 from oauth2client.service_account import ServiceAccountCredentials
 
 # --------------------------------------------------------------------------------------
@@ -74,7 +73,7 @@ def read_pairs_from_sheet(ws: gspread.Worksheet) -> List[Tuple[int, str]]:
 
 
 # --------------------------------------------------------------------------------------
-# ForexNewsAPI helpers
+# ForexNewsAPI Sentiment helpers
 # --------------------------------------------------------------------------------------
 
 
@@ -87,37 +86,36 @@ def create_session() -> requests.Session:
     return s
 
 
-def fetch_news_for_pair(
+def fetch_sentiment_for_pair(
     session: requests.Session,
-    base_url: str,
+    sentiment_url: str,
     api_key: str,
     pair_code_oanda: str,
-    items: int,
     date_range: str,
     timeout: int = 15,
-) -> Optional[List[Dict[str, Any]]]:
+) -> Optional[Dict[str, Any]]:
     """
-    Fetch latest news for a currency pair from ForexNewsAPI.
+    Fetch sentiment for a currency pair from ForexNewsAPI's Sentiment Analysis endpoint.
 
-    Docs example: GET https://forexnewsapi.com/api/v1?currencypair=EUR-USD&items=10&token=YOUR_KEY
+    Expected pattern (you'll confirm in your docs):
+        GET {sentiment_url}?currencypair=EUR-USD&date=last7days&token=YOUR_KEY
+
     We convert OANDA style 'EUR_USD' -> 'EUR-USD'.
     """
     pair_fx = pair_code_oanda.replace("_", "-")
 
     params = {
         "currencypair": pair_fx,
-        "items": items,
-        "token": api_key,
-        # date can be 'last7days', 'today', 'last30days', etc. :contentReference[oaicite:1]{index=1}
         "date": date_range,
+        "token": api_key,
     }
 
     try:
-        resp = session.get(base_url, params=params, timeout=timeout)
+        resp = session.get(sentiment_url, params=params, timeout=timeout)
         resp.raise_for_status()
     except requests.HTTPError as e:
         logger.warning(
-            "HTTP error for pair %s (%s): %s",
+            "HTTP error (sentiment) for pair %s (%s): %s",
             pair_code_oanda,
             pair_fx,
             e
@@ -125,7 +123,7 @@ def fetch_news_for_pair(
         return None
     except requests.RequestException as e:
         logger.warning(
-            "Request exception for pair %s (%s): %s",
+            "Request exception (sentiment) for pair %s (%s): %s",
             pair_code_oanda,
             pair_fx,
             e
@@ -135,117 +133,143 @@ def fetch_news_for_pair(
     try:
         data = resp.json()
     except ValueError:
-        logger.warning("Invalid JSON for pair %s (%s)", pair_code_oanda, pair_fx)
+        logger.warning("Invalid JSON (sentiment) for pair %s (%s)", pair_code_oanda, pair_fx)
         return None
 
-    # ForexNewsAPI usually returns a list of news items directly, or under a key.
-    if isinstance(data, list):
-        return data
+    # ForexNewsAPI sentiment endpoints may return a dict or list.
+    # We'll try a few reasonable shapes:
+    item: Optional[Dict[str, Any]] = None
+
     if isinstance(data, dict):
-        # Try common keys
-        for key in ("data", "news", "items", "results"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
-    # Fallback
-    return None
+        # e.g. {'currencypair': 'EUR-USD', 'sentimentscore': 0.85, ...}
+        item = data
+        # or sometimes under a key like 'data' / 'results'
+        for key in ("data", "results", "sentiment"):
+            if isinstance(data.get(key), dict):
+                item = data[key]
+                break
+            if isinstance(data.get(key), list) and data[key]:
+                item = data[key][0]
+                break
+    elif isinstance(data, list) and data:
+        item = data[0]
+
+    if not isinstance(item, dict):
+        logger.warning("Unexpected sentiment payload for pair %s: %r", pair_code_oanda, data)
+        return None
+
+    return item
 
 
-def aggregate_sentiment_from_news(
-    news_items: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+def normalize_sentiment_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Take article-level news with sentiment labels and aggregate metrics.
+    Normalize ForexNewsAPI sentiment response into a uniform dict we can write to the sheet.
 
-    We assume each item has a 'sentiment' field that is 'positive', 'negative' or 'neutral'. :contentReference[oaicite:2]{index=2}
-    If ForexNewsAPI returns a numeric sentiment field too, we try to use it if present.
+    Their docs mention Sentiment Score ranges from -1.5 (Negative) to +1.5 (Positive). :contentReference[oaicite:1]{index=1}
+    We'll try to detect:
+      - sentiment score (numeric)
+      - positive / negative / neutral counts if available
+      - date of the sentiment value
     """
 
-    pos = neg = neu = 0
-    score_sum = 0.0
-    score_count = 0
+    # Try several likely keys for the numeric score
+    score_raw = (
+        item.get("sentimentscore")
+        or item.get("sentiment_score")
+        or item.get("score")
+        or item.get("sentimentScore")
+    )
 
-    latest_time = None
-    latest_title = ""
-    latest_source = ""
+    try:
+        score = float(score_raw)
+    except (TypeError, ValueError):
+        score = None
 
-    for item in news_items:
-        sent = str(item.get("sentiment", "")).lower()
-        # Optional numeric score field (if present)
-        numeric_sent = item.get("sentimentscore") or item.get("sentiment_score")
+    # Optional counts / totals (these may or may not exist)
+    pos = (
+        item.get("positive")
+        or item.get("pos")
+        or item.get("num_positive")
+        or item.get("count_positive")
+    )
+    neg = (
+        item.get("negative")
+        or item.get("neg")
+        or item.get("num_negative")
+        or item.get("count_negative")
+    )
+    neu = (
+        item.get("neutral")
+        or item.get("neu")
+        or item.get("num_neutral")
+        or item.get("count_neutral")
+    )
+    total = (
+        item.get("total")
+        or item.get("total_news")
+        or item.get("num_articles")
+        or item.get("articles")
+    )
 
-        if numeric_sent is not None:
-            try:
-                numeric_sent = float(numeric_sent)
-                score_sum += numeric_sent
-                score_count += 1
-            except (TypeError, ValueError):
-                pass
-        else:
-            # Fall back to +1 / -1 / 0
-            if sent == "positive":
-                score_sum += 1.0
-                pos += 1
-                score_count += 1
-            elif sent == "negative":
-                score_sum -= 1.0
-                neg += 1
-                score_count += 1
-            elif sent == "neutral":
-                neu += 1
-                score_count += 1
-            else:
-                # Unknown / missing sentiment -> ignore
-                pass
+    def _to_int(x):
+        try:
+            return int(x)
+        except (TypeError, ValueError):
+            return None
 
-        # Track "latest" by published date if present, else just first item
-        item_time = item.get("date") or item.get("published_at") or item.get("time")
-        if latest_time is None and item_time:
-            latest_time = item_time
-            latest_title = str(item.get("title", ""))[:200]
-            latest_source = str(item.get("source", ""))[:100]
+    pos_i = _to_int(pos)
+    neg_i = _to_int(neg)
+    neu_i = _to_int(neu)
+    total_i = _to_int(total)
 
-    if score_count == 0:
-        avg_score = ""
+    # If total isn't provided, approximate from pos/neg/neu
+    if total_i is None:
+        parts = [v for v in (pos_i, neg_i, neu_i) if v is not None]
+        total_i = sum(parts) if parts else None
+
+    # Percentages if we have total
+    if total_i and total_i > 0:
+        pos_pct = round((pos_i or 0) / total_i * 100.0, 1)
+        neg_pct = round((neg_i or 0) / total_i * 100.0, 1)
     else:
-        avg_score = round(score_sum / score_count, 3)
+        pos_pct = ""
+        neg_pct = ""
 
-    total = pos + neg + neu
-    if total == 0:
-        pos_pct = neg_pct = neu_pct = ""
+    # Date/time field for when this sentiment is measured
+    sent_date = (
+        item.get("date")
+        or item.get("sentiment_date")
+        or item.get("asof")
+        or ""
+    )
+
+    # Label + emoji from score
+    if score is None:
+        label = ""
+        emoji = ""
     else:
-        pos_pct = round(pos / total * 100.0, 1)
-        neg_pct = round(neg / total * 100.0, 1)
-        neu_pct = round(neu / total * 100.0, 1)
-
-    # Map average numeric score to a coarse label/emoji
-    label = ""
-    emoji = ""
-    if isinstance(avg_score, float):
-        if avg_score >= 0.6:
+        if score >= 1.0:
             label, emoji = "Strongly Bullish", "🟢"
-        elif avg_score >= 0.2:
+        elif score >= 0.3:
             label, emoji = "Bullish", "✅"
-        elif avg_score > -0.2:
-            label, emoji = "Neutral", "⚪"
-        elif avg_score > -0.6:
+        elif score <= -1.0:
+            label, emoji = "Strongly Bearish", "🔴"
+        elif score <= -0.3:
             label, emoji = "Bearish", "⚠️"
         else:
-            label, emoji = "Strongly Bearish", "🔴"
+            label, emoji = "Neutral", "⚪"
+
+    if score is not None:
+        score = round(score, 3)
 
     return {
-        "avg_score": avg_score,
+        "score": score,
         "label": label,
         "emoji": emoji,
-        "pos": pos,
-        "neg": neg,
-        "neu": neu,
         "pos_pct": pos_pct,
         "neg_pct": neg_pct,
-        "neu_pct": neu_pct,
-        "total": total,
-        "latest_time": latest_time or "",
-        "latest_title": latest_title,
-        "latest_source": latest_source,
+        "total": total_i if total_i is not None else "",
+        "date": sent_date,
     }
 
 
@@ -261,21 +285,20 @@ def write_sentiment_to_sheet(
     """
     row_results: {row_index: sentiment_dict}
 
-    Columns we use:
+    Columns we use (T–Z):
 
-    T: News_Sent_Score_7d      (numeric, -1..+1-ish)
+    T: News_Sent_Score_7d      (numeric, -1.5..+1.5-ish)
     U: News_Sent_Label_7d      (text like "Bullish")
     V: News_Sent_Emoji_7d      (emoji)
-    W: News_Pos_Pct_7d         (% positive)
-    X: News_Neg_Pct_7d         (% negative)
-    Y: News_Total_Articles_7d
-    Z: News_Last_Update        (source + time)
+    W: News_Pos_Pct_7d         (% positive, if available)
+    X: News_Neg_Pct_7d         (% negative, if available)
+    Y: News_Total_Articles_7d  (if available)
+    Z: News_Sentiment_Date_7d  (date/as-of from API)
     """
     if not row_results:
         logger.info("No sentiment results to write.")
         return
 
-    # Header row
     headers = [
         "News_Sent_Score_7d",
         "News_Sent_Label_7d",
@@ -283,7 +306,7 @@ def write_sentiment_to_sheet(
         "News_Pos_Pct_7d",
         "News_Neg_Pct_7d",
         "News_Total_Articles_7d",
-        "News_Last_Update",
+        "News_Sentiment_Date_7d",
     ]
 
     # Write headers into T1:Z1 (7 columns)
@@ -292,7 +315,6 @@ def write_sentiment_to_sheet(
         values=[headers],
     )
 
-    # Build values list for rows 2..N
     max_row = max(row_results.keys())
     values: List[List[Any]] = []
 
@@ -303,32 +325,26 @@ def write_sentiment_to_sheet(
             values.append([""] * len(headers))
             continue
 
-        avg_score = sentiment["avg_score"]
+        score = sentiment["score"]
         label = sentiment["label"]
         emoji = sentiment["emoji"]
         pos_pct = sentiment["pos_pct"]
         neg_pct = sentiment["neg_pct"]
         total = sentiment["total"]
-        latest_time = sentiment["latest_time"]
-        latest_source = sentiment["latest_source"]
-
-        last_update = ""
-        if latest_time or latest_source:
-            last_update = f"{latest_source} | {latest_time}".strip(" |")
+        date = sentiment["date"]
 
         row_vals = [
-            avg_score,
+            score if score is not None else "",
             label,
             emoji,
             pos_pct,
             neg_pct,
             total,
-            last_update,
+            date,
         ]
 
         values.append(row_vals)
 
-    # Now write into T2:Z{max_row}
     end_row = max_row
     range_name = f"T2:Z{end_row}"
     logger.info("Updating sentiment columns %s", range_name)
@@ -351,47 +367,45 @@ def run_sentiment_once():
     if not api_key:
         raise RuntimeError("FOREX_NEWS_API_KEY env var is required")
 
-    base_url = os.environ.get(
-        "FOREX_NEWS_BASE_URL",
-        "https://forexnewsapi.com/api/v1",
+    # IMPORTANT:
+    # This should be the Sentiment Analysis endpoint URL for INDIVIDUAL pairs,
+    # as shown under "GET Sentiment Analysis" -> "For Individual currency pairs" in the docs.
+    # Example guess (override if docs show different):
+    #   https://forexnewsapi.com/api/v1/sentiment
+    sentiment_url = os.environ.get(
+        "FOREX_NEWS_SENTIMENT_URL",
+        "https://forexnewsapi.com/api/v1/sentiment",
     )
 
-    # how many articles per pair (1–50 per docs) :contentReference[oaicite:3]{index=3}
-    items = int(os.environ.get("FOREX_NEWS_ITEMS", "20"))
-
-    # date window for news, e.g. 'last7days', 'last30days', 'today', etc. :contentReference[oaicite:4]{index=4}
+    # date window for sentiment, e.g. 'last7days', 'last30days', 'today', etc.
     date_range = os.environ.get("FOREX_NEWS_DATE", "last7days")
 
     gc = get_gspread_client()
     ws = open_screener_sheet(gc, sheet_name, tab_name)
 
     pairs = read_pairs_from_sheet(ws)
-    logger.info("Updating news sentiment for %d pairs", len(pairs))
+    logger.info("Updating news sentiment (Sentiment endpoint) for %d pairs", len(pairs))
 
     session = create_session()
-
     row_results: Dict[int, Dict[str, Any]] = {}
 
     for idx, (row_idx, pair_code) in enumerate(pairs, start=1):
         logger.info("(%d/%d) Fetching sentiment for %s", idx, len(pairs), pair_code)
 
-        news_items = fetch_news_for_pair(
+        raw_item = fetch_sentiment_for_pair(
             session=session,
-            base_url=base_url,
+            sentiment_url=sentiment_url,
             api_key=api_key,
             pair_code_oanda=pair_code,
-            items=items,
             date_range=date_range,
         )
 
-        if not news_items:
-            # No news / error -> leave row untouched
+        if not raw_item:
             continue
 
-        sentiment = aggregate_sentiment_from_news(news_items)
+        sentiment = normalize_sentiment_item(raw_item)
         row_results[row_idx] = sentiment
 
-        # Tiny sleep to be polite to API
         time.sleep(0.2)
 
     write_sentiment_to_sheet(ws, row_results)
@@ -406,7 +420,7 @@ def main_loop():
     )  # default: once per day
 
     logger.info(
-        "Starting Forex sentiment bot. Sheet='%s' Tab='%s' Interval=%ss",
+        "Starting Forex sentiment bot (Sentiment endpoint). Sheet='%s' Tab='%s' Interval=%ss",
         sheet_name,
         tab_name,
         interval_seconds,
