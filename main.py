@@ -1,317 +1,275 @@
 import os
-import json
 import time
-import math
+import json
 import logging
-from typing import Any, Dict, List
+from typing import Optional, Tuple, List
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
 # -----------------------------------------------------------------------------
-# Logging
+# Logging setup
 # -----------------------------------------------------------------------------
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# Environment
+# Environment / config
 # -----------------------------------------------------------------------------
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
-GOOGLE_SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "Oanda-Screener")
+GOOGLE_SHEET_NAME = os.getenv("FOREX_SHEET_NAME", "Active-Investing")
+FOREX_SENTIMENT_TAB = os.getenv("FOREX_SENTIMENT_TAB", "Oanda-Screener")
+FOREX_NEWS_API_KEY = os.getenv("FOREX_NEWS_API_KEY")
 
-FOREX_NEWS_API_KEY = os.getenv("FOREX_NEWS_API_KEY", "")
-# base endpoint – SHOULD BE: https://forexnewsapi.com/api/v1/stat
-FOREX_NEWS_SENTIMENT_URL = os.getenv(
-    "FOREX_NEWS_SENTIMENT_URL", "https://forexnewsapi.com/api/v1/stat"
-)
-FOREX_NEWS_DATE = os.getenv("FOREX_NEWS_DATE", "last7days")
-FOREX_SENTIMENT_INTERVAL = int(os.getenv("FOREX_SENTIMENT_INTERVAL", "21600"))
+# Optional: if you later upgrade your ForexNewsAPI plan to support &date=
+# you can set this env var (e.g. "last7days", "last30days"). For the current
+# plan we must NOT send any date parameter or we get 403.
+FOREX_NEWS_DATE = (os.getenv("FOREX_NEWS_DATE") or "").strip() or None
 
-if not GOOGLE_CREDS_JSON:
-    logger.error("GOOGLE_CREDS_JSON env var is required")
-if not FOREX_NEWS_API_KEY:
-    logger.warning("FOREX_NEWS_API_KEY is not set; sentiment will be blank")
+# How often to refresh sentiment (seconds)
+FOREX_SENTIMENT_INTERVAL = int(os.getenv("FOREX_SENTIMENT_INTERVAL", "21600"))  # 6h default
+
+# gspread scopes (include Drive so we can open by name)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# Sheet layout:
+# Col A: Pair (e.g. "EUR_USD")
+# We will write sentiment into columns T:Z (20–26)
+SENTIMENT_FIRST_COL = 20  # Column T
+SENTIMENT_LAST_COL = 26   # Column Z
+FIRST_DATA_ROW = 2        # Header is row 1
 
 
 # -----------------------------------------------------------------------------
 # Google Sheets helpers
 # -----------------------------------------------------------------------------
 def get_gspread_client() -> gspread.Client:
-    creds_info = json.loads(GOOGLE_CREDS_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    return gspread.authorize(creds)
+    if not GOOGLE_CREDS_JSON:
+        raise RuntimeError("GOOGLE_CREDS_JSON env var is not set")
+
+    info = json.loads(GOOGLE_CREDS_JSON)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    return client
 
 
-def read_pairs_from_sheet(sheet_name: str, tab_name: str) -> List[str]:
-    """Read column A (pairs) from the screener sheet, skipping header and blanks."""
-    gc = get_gspread_client()
-    sh = gc.open(sheet_name)
-    ws = sh.worksheet(tab_name)
-
-    col_a = ws.col_values(1)  # 1-based index
-    if not col_a or len(col_a) <= 1:
-        return []
-
-    # Skip header (row 1)
-    pairs = [v.strip() for v in col_a[1:] if v.strip()]
-    return pairs
-
-
-def clean_value(v: Any) -> Any:
-    """Make values safe for Sheets (no NaN / None)."""
-    if v is None:
-        return ""
-    if isinstance(v, float) and math.isnan(v):
-        return ""
-    return v
-
-
-def update_sentiment_columns(
-    sheet_name: str, tab_name: str, sentiments: List[Dict[str, Any]]
-) -> None:
-    """
-    Write sentiment data into columns T–Z.
-    T: news_score_7d
-    U: news_label_7d
-    V: news_bullish_ratio_7d
-    W: news_bearish_ratio_7d
-    X: news_articles_7d
-    Y: news_top_keywords_7d
-    Z: news_emoji_7d
-    """
-    if not sentiments:
-        logger.info("No sentiments to write")
-        return
-
-    gc = get_gspread_client()
-    sh = gc.open(sheet_name)
-    ws = sh.worksheet(tab_name)
-
-    headers = [
-        [
-            "news_score_7d",
-            "news_label_7d",
-            "news_bullish_ratio_7d",
-            "news_bearish_ratio_7d",
-            "news_articles_7d",
-            "news_top_keywords_7d",
-            "news_emoji_7d",
-        ]
-    ]
-    ws.update(values=headers, range_name="T1:Z1")
-
-    values: List[List[Any]] = []
-    for s in sentiments:
-        row = [
-            clean_value(s.get("news_score_7d")),
-            clean_value(s.get("news_label_7d")),
-            clean_value(s.get("news_bullish_ratio_7d")),
-            clean_value(s.get("news_bearish_ratio_7d")),
-            clean_value(s.get("news_articles_7d")),
-            clean_value(s.get("news_top_keywords_7d")),
-            clean_value(s.get("news_emoji_7d")),
-        ]
-        values.append(row)
-
-    last_row = len(values) + 1  # +1 for header
-    range_name = f"T2:Z{last_row}"
-    logger.info("Updating sentiment columns %s", range_name)
-    ws.update(values=values, range_name=range_name)
+def get_worksheet() -> gspread.Worksheet:
+    client = get_gspread_client()
+    sh = client.open(GOOGLE_SHEET_NAME)
+    ws = sh.worksheet(FOREX_SENTIMENT_TAB)
+    return ws
 
 
 # -----------------------------------------------------------------------------
-# ForexNewsAPI sentiment
+# ForexNewsAPI sentiment fetching
 # -----------------------------------------------------------------------------
-def score_to_emoji(score: Any) -> str:
-    """Map numeric sentiment score to a simple emoji."""
-    if not isinstance(score, (int, float)):
-        return ""
-    if score >= 0.5:
-        return "🟢"  # strong bullish
-    if score >= 0.2:
-        return "🟡"  # mildly bullish / positive
-    if score <= -0.5:
-        return "🔴"  # strong bearish
-    if score <= -0.2:
-        return "🟠"  # mildly bearish / negative
-    return "⚪"  # neutral / mixed
-
-
-def fetch_sentiment_for_pair(session: requests.Session, pair: str) -> Dict[str, Any]:
+def fetch_pair_sentiment(
+    session: requests.Session,
+    api_key: str,
+    pair_code: str,
+) -> Optional[Tuple[float, float, float, float, int, str]]:
     """
-    Call ForexNewsAPI /stat endpoint for a single FX pair and return
-    a sentiment metrics dict. On error, log details and return neutral/NaN values.
+    Fetch sentiment stats for a single FX pair from ForexNewsAPI.
+
+    Returns:
+        (avg_score, pos_pct, neg_pct, neu_pct, article_count, status_text)
+        or None if there was an HTTP / parsing error.
     """
-    api_key = FOREX_NEWS_API_KEY
-    if not api_key:
-        logger.error("FOREX_NEWS_API_KEY is not set; skipping sentiment for %s", pair)
-        return {
-            "news_score_7d": float("nan"),
-            "news_label_7d": "",
-            "news_bullish_ratio_7d": float("nan"),
-            "news_bearish_ratio_7d": float("nan"),
-            "news_articles_7d": 0,
-            "news_top_keywords_7d": "",
-            "news_emoji_7d": "",
-        }
+    base_url = "https://forexnewsapi.com/api/v1/stat"
 
-    # Oanda uses "EUR_USD", ForexNewsAPI wants "EUR-USD"
-    cp = pair.replace("_", "-")
-
-    url = FOREX_NEWS_SENTIMENT_URL.rstrip("/")  # should be .../api/v1/stat
+    # IMPORTANT: the current subscription plan returns 403 if we send &date=
+    # ("date is not available with current Subscription Plan.")
+    # So by default we do NOT send date at all.
     params = {
-        "currencypair": cp,
-        "date": FOREX_NEWS_DATE,  # e.g. "last7days" or "last30days"
-        "page": 1,
+        "currencypair": pair_code,
         "token": api_key,
     }
+    if FOREX_NEWS_DATE:
+        # Only include if explicitly configured and the plan supports it.
+        params["date"] = FOREX_NEWS_DATE
 
     try:
-        resp = session.get(url, params=params, timeout=15)
-        text_preview = resp.text[:500] if resp.text else ""
+        resp = session.get(base_url, params=params, timeout=10)
+    except requests.RequestException as e:
+        logging.warning("Network error fetching sentiment for %s: %s", pair_code, e)
+        return None
 
-        if resp.status_code != 200:
-            logger.warning(
-                "HTTP error (sentiment) for pair %s (%s): %s | body: %s",
-                pair,
-                cp,
-                resp.status_code,
-                text_preview,
-            )
-            return {
-                "news_score_7d": float("nan"),
-                "news_label_7d": "",
-                "news_bullish_ratio_7d": float("nan"),
-                "news_bearish_ratio_7d": float("nan"),
-                "news_articles_7d": 0,
-                "news_top_keywords_7d": "",
-                "news_emoji_7d": "",
-            }
+    if resp.status_code != 200:
+        body_snip = resp.text.strip()
+        if len(body_snip) > 200:
+            body_snip = body_snip[:200] + "..."
+        logging.warning(
+            "HTTP error (sentiment) for pair %s: %s | body: %s",
+            pair_code,
+            resp.status_code,
+            body_snip,
+        )
+        return None
 
+    try:
         data = resp.json()
-        # If API wraps stats in "data", unwrap that
-        if isinstance(data, dict) and "data" in data:
-            root = data.get("data", {})
-        else:
-            root = data
-
     except Exception as e:
-        logger.warning("Exception calling sentiment API for %s (%s): %s", pair, cp, e)
-        return {
-            "news_score_7d": float("nan"),
-            "news_label_7d": "",
-            "news_bullish_ratio_7d": float("nan"),
-            "news_bearish_ratio_7d": float("nan"),
-            "news_articles_7d": 0,
-            "news_top_keywords_7d": "",
-            "news_emoji_7d": "",
-        }
+        logging.warning("JSON parse error for %s: %s | body: %s", pair_code, e, resp.text[:200])
+        return None
 
-    # -------------------------------------------------------------------------
-    # Best-effort field extraction (we'll see exact keys from logs)
-    # -------------------------------------------------------------------------
-    score = None
-    label = ""
-    bull = None
-    bear = None
-    news_count: Any = None
-    top_keywords: List[str] = []
+    # The exact schema can vary; we try to be defensive.
+    # Typical shape (from docs) is something like:
+    # {
+    #   "data": [
+    #      {
+    #         "date": "2024-01-01",
+    #         "sentiment": {
+    #             "score": 0.12,
+    #             "positive": 60,
+    #             "negative": 20,
+    #             "neutral": 20
+    #         },
+    #         "news": 15
+    #      },
+    #      ...
+    #   ]
+    # }
+    stats = data.get("data") or data.get("stats") or []
 
-    if isinstance(root, dict):
-        score = (
-            root.get("sentiment_avg")
-            or root.get("sentiment_score")
-            or root.get("sentiment")
-            or root.get("score")
-        )
+    if not stats:
+        return 0.0, 0.0, 0.0, 0.0, 0, "no-data"
 
-        label = (
-            root.get("sentiment_label")
-            or root.get("label")
-            or root.get("overall_sentiment")
-            or ""
-        )
+    total_score = 0.0
+    total_pos = 0.0
+    total_neg = 0.0
+    total_neu = 0.0
+    total_news = 0
+    days_count = 0
 
-        bull = root.get("bullish_ratio") or root.get("bullish_percent")
-        bear = root.get("bearish_ratio") or root.get("bearish_percent")
+    for day in stats:
+        sent = day.get("sentiment") or {}
+        score = float(sent.get("score", 0.0) or 0.0)
+        pos = float(sent.get("positive", 0.0) or 0.0)
+        neg = float(sent.get("negative", 0.0) or 0.0)
+        neu = float(sent.get("neutral", 0.0) or 0.0)
+        news_count = int(day.get("news", 0) or 0)
 
-        # Normalize percentages > 1 into [0,1]
-        if isinstance(bull, (int, float)) and bull > 1.0:
-            bull = bull / 100.0
-        if isinstance(bear, (int, float)) and bear > 1.0:
-            bear = bear / 100.0
+        total_score += score
+        total_pos += pos
+        total_neg += neg
+        total_neu += neu
+        total_news += news_count
+        days_count += 1
 
-        news_count = (
-            root.get("news_count")
-            or root.get("total")
-            or (len(root.get("sentiments", [])) if isinstance(root.get("sentiments"), list) else None)
-        )
+    if days_count == 0:
+        return 0.0, 0.0, 0.0, 0.0, total_news, "no-days"
 
-        kws = root.get("top_keywords") or root.get("keywords") or []
-        if isinstance(kws, list):
-            top_keywords = [str(k) for k in kws]
-        elif isinstance(kws, str):
-            top_keywords = [kws]
+    avg_score = total_score / days_count
+    avg_pos = total_pos / days_count
+    avg_neg = total_neg / days_count
+    avg_neu = total_neu / days_count
 
-    emoji = score_to_emoji(score)
-
-    return {
-        "news_score_7d": score,
-        "news_label_7d": label,
-        "news_bullish_ratio_7d": bull,
-        "news_bearish_ratio_7d": bear,
-        "news_articles_7d": news_count or 0,
-        "news_top_keywords_7d": ", ".join(top_keywords) if top_keywords else "",
-        "news_emoji_7d": emoji,
-    }
+    status_text = f"ok:{days_count}d"
+    return avg_score, avg_pos, avg_neg, avg_neu, total_news, status_text
 
 
 # -----------------------------------------------------------------------------
-# Main loop
+# Main sheet update logic
 # -----------------------------------------------------------------------------
-def run_sentiment_once() -> None:
-    pairs = read_pairs_from_sheet(GOOGLE_SHEET_NAME, GOOGLE_SHEET_TAB)
-    if not pairs:
-        logger.warning("No pairs found in sheet %s tab %s", GOOGLE_SHEET_NAME, GOOGLE_SHEET_TAB)
+def update_sheet_sentiment() -> None:
+    if not FOREX_NEWS_API_KEY:
+        logging.error("FOREX_NEWS_API_KEY is not set. Exiting sentiment update.")
         return
 
-    logger.info(
-        "Updating news sentiment (Sentiment endpoint) for %d pairs", len(pairs)
-    )
+    ws = get_worksheet()
 
-    sentiments: List[Dict[str, Any]] = []
-    with requests.Session() as session:
-        for idx, pair in enumerate(pairs, start=1):
-            logger.info("(%d/%d) Fetching sentiment for %s", idx, len(pairs), pair)
-            s = fetch_sentiment_for_pair(session, pair)
-            sentiments.append(s)
+    # Get all pair symbols from column A (starting row 2)
+    pairs_col = ws.col_values(1)  # 1 = column A
+    # First element is header; from second onward are pairs
+    pair_rows: List[Tuple[int, str]] = []
+    for idx, val in enumerate(pairs_col, start=1):
+        if idx < FIRST_DATA_ROW:
+            continue
+        val = (val or "").strip()
+        if not val:
+            continue
+        pair_rows.append((idx, val))
 
-    update_sentiment_columns(GOOGLE_SHEET_NAME, GOOGLE_SHEET_TAB, sentiments)
+    if not pair_rows:
+        logging.info("No pairs found in column A; nothing to update.")
+        return
+
+    logging.info("Updating news sentiment (Sentiment endpoint) for %d pairs", len(pair_rows))
+
+    session = requests.Session()
+
+    # Prepare rows for T..Z, aligned to pair_rows
+    # Columns:
+    # T: AvgScore
+    # U: AvgPos%
+    # V: AvgNeg%
+    # W: AvgNeu%
+    # X: TotalNewsCount
+    # Y: LastUpdated (ISO string)
+    # Z: Status / debug
+    values: List[List] = []
+
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    for i, (row_idx, pair_name) in enumerate(pair_rows, start=1):
+        pair_code = pair_name.replace("_", "-")  # e.g. EUR_USD -> EUR-USD
+        logging.info("(%d/%d) Fetching sentiment for %s", i, len(pair_rows), pair_name)
+
+        result = fetch_pair_sentiment(session, FOREX_NEWS_API_KEY, pair_code)
+
+        if result is None:
+            # HTTP / parse error: leave numeric fields blank, status with error flag
+            values.append(["", "", "", "", "", ts, "error"])
+        else:
+            avg_score, avg_pos, avg_neg, avg_neu, total_news, status_text = result
+            values.append([
+                round(avg_score, 4),
+                round(avg_pos, 2),
+                round(avg_neg, 2),
+                round(avg_neu, 2),
+                total_news,
+                ts,
+                status_text,
+            ])
+
+    # Write to T2:Z{last_row}
+    first_row = FIRST_DATA_ROW
+    last_row = pair_rows[-1][0]
+    range_str = f"T{first_row}:Z{last_row}"
+    logging.info("Updating sentiment columns %s", range_str)
+
+    # NOTE: gspread deprecated old arg order; we now pass values first, then range_name.
+    ws.update(values, range_name=range_str)
+
+    logging.info("Sentiment update complete for %d rows", len(pair_rows))
 
 
-def main() -> None:
-    logger.info(
-        "Starting Forex sentiment bot (Sentiment endpoint). Sheet='%s' Tab='%s' Interval=%ss",
+# -----------------------------------------------------------------------------
+# Entrypoint loop
+# -----------------------------------------------------------------------------
+def main():
+    logging.info(
+        "Starting Forex sentiment bot (Sentiment endpoint). "
+        "Sheet='%s' Tab='%s' Interval=%ss",
         GOOGLE_SHEET_NAME,
-        GOOGLE_SHEET_TAB,
+        FOREX_SENTIMENT_TAB,
         FOREX_SENTIMENT_INTERVAL,
     )
+
     while True:
         try:
-            run_sentiment_once()
+            update_sheet_sentiment()
         except Exception as e:
-            logger.exception("Error in sentiment loop: %s", e)
-        logger.info("Sleeping for %s seconds...", FOREX_SENTIMENT_INTERVAL)
+            logging.exception("Unexpected error during sentiment update: %s", e)
+
+        logging.info("Sleeping for %s seconds...", FOREX_SENTIMENT_INTERVAL)
         time.sleep(FOREX_SENTIMENT_INTERVAL)
 
 
