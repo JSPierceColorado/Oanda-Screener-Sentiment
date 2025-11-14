@@ -1,3 +1,5 @@
-requests
-gspread
-google-auth
+gspread==6.1.2
+oauth2client==4.1.3
+pandas==2.2.3
+requests==2.32.3
+python-dateutil==2.9.0.post0
